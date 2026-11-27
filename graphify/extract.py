@@ -72,7 +72,13 @@ from graphify.extractors.csharp import (
     is_csharp_explicit_interface_node,
 )
 from graphify.extractors.dart import extract_dart  # noqa: F401
-from graphify.extractors.dm import extract_dm, extract_dmf, extract_dmi, extract_dmm  # noqa: F401
+from graphify.extractors.dm import (  # noqa: F401
+    _DM_IMPLICIT_PARENTS,
+    extract_dm,
+    extract_dmf,
+    extract_dmi,
+    extract_dmm,
+)
 from graphify.extractors.elixir import extract_elixir  # noqa: F401
 from graphify.extractors.erlang import extract_erlang, resolve_erlang_remote_calls  # noqa: F401
 from graphify.extractors.fortran import _cpp_preprocess, extract_fortran  # noqa: F401
@@ -10158,6 +10164,206 @@ def _resolve_kotlin_member_calls(
         })
 
 
+# ── DM (BYOND DreamMaker) call resolution ────────────────────────────────────
+
+
+def resolve_dm_calls(
+    per_file: list[dict],
+    all_nodes: list[dict],
+    all_edges: list[dict],
+) -> None:
+    """Resolve BYOND DreamMaker calls across files.
+
+    DM proc node labels are path-qualified (``/obj/item/device/flash/clown_check()``)
+    while a call site names only the proc (``clown_check(user)``). The shared
+    cross-file pass matches callees against node labels, so it can only bind root
+    ``/proc/foo()`` declarations; every type-qualified proc stayed unresolved. On
+    vgstation13 that left 102,626 call sites unbound, 19,207 of them naming a proc
+    that is unique in the whole corpus.
+
+    This pass indexes DM procs by bare name and by ``(owner type, name)``, then:
+
+      * binds ``..()`` to the nearest ancestor type that defines the same proc;
+      * binds ``src.foo()`` to the enclosing type's chain and ``usr.foo()`` to
+        ``/mob``;
+      * binds ``M.foo()`` when the receiver is typed by a parameter, local or
+        member var (``mob/living/M``, ``var/obj/item/thing/T``), walking the DM
+        inheritance chain (path prefix, BYOND's built-in type tree, or an
+        explicit ``parent_type``);
+      * falls back to a corpus-unique root ``/proc/foo`` for unqualified calls,
+        and to a corpus-unique bare name for an untyped receiver;
+      * binds function-like macro invocations to their ``#define`` node.
+
+    Only explicit syntax (``..()``, ``src.``) is EXTRACTED; inferred receivers and
+    unique-name matches are INFERRED with a score, and an untyped receiver whose
+    callee is defined by several types stays unresolved instead of being inked to
+    an arbitrary definition.
+
+    Runs after node-id remapping so ``caller_nid`` values are final.
+    """
+    dm_results = [r for r in per_file if isinstance(r, dict) and "dm_types" in r]
+    if not dm_results:
+        return
+
+    def _is_dm(node: dict) -> bool:
+        return str(node.get("source_file", "")).lower().endswith((".dm", ".dme"))
+
+    def _parent(path: str) -> str:
+        parent = path.rpartition("/")[0]
+        if parent and parent != "/":
+            return parent
+        if path == "/datum":
+            return ""
+        return _DM_IMPLICIT_PARENTS.get(path, "/datum")
+
+    proc_by_owner: dict[tuple[str, str], list[str]] = {}
+    proc_by_name: dict[str, list[str]] = {}
+    root_procs: set[str] = set()
+    macro_by_name: dict[str, list[str]] = {}
+    for node in all_nodes:
+        if not isinstance(node, dict) or not _is_dm(node):
+            continue
+        nid = node.get("id")
+        label = str(node.get("label", ""))
+        if not nid or not label:
+            continue
+        if label.startswith("#define "):
+            macro_by_name.setdefault(label[len("#define "):].strip(), []).append(nid)
+            continue
+        if not label.endswith("()"):
+            continue
+        owner, _, name = label[:-2].rpartition("/")
+        if not name:
+            continue
+        proc_by_owner.setdefault((owner.lower(), name.lower()), []).append(nid)
+        proc_by_name.setdefault(name.lower(), []).append(nid)
+        if not owner:
+            root_procs.add(nid)
+
+    type_vars: dict[str, dict[str, str]] = {}
+    explicit_parent: dict[str, str] = {}
+    for result in dm_results:
+        for type_path, info in (result.get("dm_types") or {}).items():
+            if not isinstance(info, dict):
+                continue
+            vars_map = info.get("vars") or {}
+            if vars_map:
+                table = type_vars.setdefault(str(type_path).lower(), {})
+                for name, type_name in vars_map.items():
+                    table[str(name).lower()] = type_name
+            parent = info.get("parent")
+            if parent:
+                explicit_parent[str(type_path).lower()] = parent
+
+    def chain(path: str):
+        """Type path then its DM ancestors (explicit ``parent_type`` wins)."""
+        seen: set[str] = set()
+        cur = path
+        while cur and cur != "/":
+            key = cur.lower()
+            if key in seen:
+                return
+            seen.add(key)
+            yield cur
+            cur = explicit_parent.get(key) or _parent(cur)
+
+    def proc_in_chain(owner: str, name: str) -> "str | None":
+        if not owner:
+            return None
+        key = name.lower()
+        for path in chain(owner):
+            hits = proc_by_owner.get((path.lower(), key))
+            if hits:
+                # Two definitions of one proc on one type is a duplicate
+                # declaration; an ambiguous name must not become a god edge.
+                return hits[0] if len(hits) == 1 else None
+        return None
+
+    def receiver_type(owner: str, receiver: str, known: "str | None") -> "str | None":
+        if known:
+            return known
+        key = receiver.lower()
+        for path in chain(owner):
+            hit = type_vars.get(path.lower(), {}).get(key)
+            if hit:
+                return hit
+        return None
+
+    existing = {(edge.get("source"), edge.get("target")) for edge in all_edges}
+
+    def emit(caller: str, target: str, raw: dict, confidence: str,
+             score: float, context: str, relation: str = "calls") -> None:
+        if not caller or not target or caller == target:
+            return
+        if (caller, target) in existing:
+            return
+        existing.add((caller, target))
+        all_edges.append({
+            "source": caller,
+            "target": target,
+            "relation": relation,
+            "context": context,
+            "confidence": confidence,
+            "confidence_score": score,
+            "source_file": raw.get("source_file", ""),
+            "source_location": raw.get("source_location"),
+            "weight": 1.0,
+        })
+
+    for result in dm_results:
+        for raw_call in result.get("raw_calls") or []:
+            caller = raw_call.get("caller_nid")
+            callee = raw_call.get("callee")
+            if not caller or not callee:
+                continue
+            kind = raw_call.get("kind", "global")
+            owner = raw_call.get("owner") or ""
+            callee_key = str(callee).lower()
+            target: "str | None" = None
+            confidence, score, context = "INFERRED", 0.85, "call"
+
+            if kind == "parent":
+                parent = explicit_parent.get(owner.lower()) or _parent(owner)
+                target = proc_in_chain(parent, callee)
+                confidence, score, context = "EXTRACTED", 1.0, "super"
+            elif kind == "member":
+                receiver = raw_call.get("receiver")
+                resolved_type = None
+                if receiver == "src":
+                    resolved_type = owner
+                elif receiver == "usr":
+                    resolved_type = "/mob"
+                elif receiver:
+                    resolved_type = receiver_type(
+                        owner, receiver, raw_call.get("receiver_type"))
+                if resolved_type:
+                    # The receiver's type is known, so only its chain may bind:
+                    # an unqualified unique-name guess would attach the call to
+                    # an unrelated type's proc.
+                    target = proc_in_chain(resolved_type, callee)
+                else:
+                    hits = proc_by_name.get(callee_key, [])
+                    if len(hits) == 1:
+                        target = hits[0]
+            else:
+                # An unqualified call is dynamic on src in BYOND: the enclosing
+                # type's chain wins, then a corpus-unique root `/proc/foo`.
+                # A proc defined only on an unrelated type must not capture it.
+                target = proc_in_chain(owner, callee) if owner else None
+                if target is None:
+                    hits = proc_by_name.get(callee_key, [])
+                    if len(hits) == 1 and hits[0] in root_procs:
+                        target = hits[0]
+
+            if target is not None:
+                emit(caller, target, raw_call, confidence, score, context)
+                continue
+            macros = macro_by_name.get(str(callee), [])
+            if len(macros) == 1:
+                emit(caller, macros[0], raw_call, "EXTRACTED", 1.0, "macro",
+                     relation="references")
+
+
 # Kotlin import-target resolution runs EARLY (directly in extract(), before the
 # shared call pass builds its import-evidence index) — registering it in the
 # tail registry would rewrite the targets after promotion already read them.
@@ -10177,6 +10383,11 @@ register_language_resolver(
 )
 register_language_resolver(
     LanguageResolver("swift_member_calls", frozenset({".swift"}), _resolve_swift_member_calls)
+)
+# BYOND DreamMaker: type-qualified procs cannot be found by the shared label
+# matcher, so DM gets its own name/type-chain resolver (#DM-parser).
+register_language_resolver(
+    LanguageResolver("dm_calls", frozenset({".dm", ".dme"}), resolve_dm_calls)
 )
 register_language_resolver(
     LanguageResolver("python_member_calls", frozenset({".py"}), _resolve_python_member_calls)

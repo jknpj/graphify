@@ -4640,6 +4640,197 @@ def test_dm_super_call_not_emitted():
     assert not any(rc["callee"] == ".." for rc in r.get("raw_calls", []))
 
 
+def test_dm_comments_and_strings_do_not_invent_symbols():
+    r = extract_dm(FIXTURES / "dm_features.dm")
+    labels = _labels(r)
+    assert "/obj/phantom" not in labels
+    assert not any("haunt" in label for label in labels)
+
+
+def test_dm_verb_macro_and_comma_vars():
+    r = extract_dm(FIXTURES / "dm_features.dm")
+    labels = _labels(r)
+    assert "/obj/feature/use_feature()" in labels
+    assert "#define FEATURE_MACRO" in labels
+    assert "/obj/feature/var/first" in labels
+    assert "/obj/feature/var/second" in labels
+    assert "/obj/feature/var/uses" in labels
+
+
+def test_dm_interpolation_call_counts_comments_do_not():
+    r = extract_dm(FIXTURES / "dm_features.dm")
+    ids = {n["id"]: n["label"] for n in r["nodes"]}
+    hits = [e for e in r["edges"]
+            if e["relation"] == "calls"
+            and ids.get(e["source"]) == "/obj/feature/touch()"
+            and ids.get(e["target"]) == "unique_by_name()"]
+    # Only the interpolated call in `touch()`; the commented-out one is masked.
+    assert len(hits) == 1
+    assert hits[0]["source_location"] == "L20"
+
+
+def test_dm_raw_calls_carry_receiver_types():
+    r = extract_dm(FIXTURES / "dm_features.dm")
+    raw = r["raw_calls"]
+    scream = [c for c in raw if c["callee"] == "scream"]
+    assert scream and scream[0]["receiver"] == "M"
+    assert scream[0]["receiver_type"] == "/mob/living"
+    part = [c for c in raw if c["callee"] == "touch" and c.get("receiver") == "part"]
+    assert part and part[0]["receiver_type"] == "/obj/feature/part"
+    src = [c for c in raw
+           if c["callee"] == "unique_by_name" and c.get("receiver") == "src"]
+    assert src and src[0]["kind"] == "member"
+    assert src[0]["owner"] == "/obj/feature"
+
+
+def test_dm_super_call_is_reported_as_parent_call():
+    r = extract_dm(FIXTURES / "dm_features.dm")
+    super_calls = [c for c in r["raw_calls"] if c["kind"] == "parent"]
+    assert super_calls
+    callees = {c["callee"] for c in super_calls}
+    assert "touch" in callees
+    assert callees <= {"touch", "New"}
+    assert {c["owner"] for c in super_calls if c["callee"] == "touch"} >= {
+        "/obj/feature/part", "/obj/feature/part/special"}
+
+
+def test_dm_string_inside_call_args_is_not_a_call():
+    r = extract_dm(FIXTURES / "dm_features.dm")
+    # `log_me("unique_by_name()")` calls log_me only; the literal is masked.
+    assert any(c["callee"] == "log_me" for c in r["raw_calls"])
+    keys = {(c["caller_nid"], c["callee"], c["kind"], c["source_location"])
+            for c in r["raw_calls"]}
+    assert not any(k[1] == "unique_by_name" and k[2] == "global" and "L14" in k[3]
+                   for k in keys)
+
+
+def test_dm_multiline_list_literal_does_not_open_a_type_block():
+    labels = _labels(extract_dm(FIXTURES / "dm_features.dm"))
+    # `var/blocked = list(` + `/obj/feature/part,` + `)` is expression text, not
+    # a type definition: the following `to_chat(...)` must not become a member.
+    assert "/obj/feature/part/to_chat()" not in labels
+    assert "/obj/feature/part/pick_one()" not in labels
+
+
+def test_dm_resolver_binds_parent_typed_unique_and_macro_calls():
+    from graphify.extract import resolve_dm_calls
+
+    def node(nid, label):
+        return {"id": nid, "label": label, "file_type": "code",
+                "source_file": "E:/proj/code.dm", "source_location": "L1"}
+
+    nodes = [
+        node("obj_x", "/obj/x"),
+        node("obj_x_act", "/obj/x/act()"),
+        node("obj_x_child", "/obj/x/child"),
+        node("obj_x_child_act", "/obj/x/child/act()"),
+        node("mob_living", "/mob/living"),
+        node("mob_say", "/mob/say()"),
+        node("proc_only", "only_here()"),
+        node("obj_a_attack", "/obj/a/attack()"),
+        node("obj_b_attack", "/obj/b/attack()"),
+        node("macro_x", "#define MACRO_X"),
+    ]
+    caller = "obj_x_child_act"
+    location = {"source_file": "E:/proj/code.dm", "source_location": "L10"}
+    raw_calls = [
+        {**location, "caller_nid": caller, "callee": "act", "kind": "parent",
+         "owner": "/obj/x/child", "receiver": None, "receiver_type": None,
+         "is_member_call": True},
+        {**location, "caller_nid": caller, "callee": "say", "kind": "member",
+         "owner": "/obj/x/child", "receiver": "M",
+         "receiver_type": "/mob/living", "is_member_call": True},
+        {**location, "caller_nid": caller, "callee": "only_here", "kind": "global",
+         "owner": "/obj/x/child", "receiver": None, "receiver_type": None,
+         "is_member_call": False},
+        {**location, "caller_nid": caller, "callee": "attack", "kind": "member",
+         "owner": "/obj/x/child", "receiver": "target",
+         "receiver_type": None, "is_member_call": True},
+        {**location, "caller_nid": caller, "callee": "MACRO_X", "kind": "global",
+         "owner": "/obj/x/child", "receiver": None, "receiver_type": None,
+         "is_member_call": False},
+    ]
+    edges = []
+    resolve_dm_calls([{"dm_types": {}, "raw_calls": raw_calls}], nodes, edges)
+    pairs = {(e["source"], e["target"], e["relation"], e.get("context"))
+             for e in edges}
+    assert (caller, "obj_x_act", "calls", "super") in pairs
+    assert (caller, "mob_say", "calls", "call") in pairs
+    assert (caller, "proc_only", "calls", "call") in pairs
+    assert (caller, "macro_x", "references", "macro") in pairs
+    # An untyped receiver whose callee several types define stays unresolved.
+    assert not any(target in ("obj_a_attack", "obj_b_attack")
+                   for _, target, _, _ in pairs)
+
+
+def test_dm_resolver_walks_member_var_types_from_another_file():
+    from graphify.extract import resolve_dm_calls
+
+    def node(nid, label):
+        return {"id": nid, "label": label, "file_type": "code",
+                "source_file": "E:/proj/code.dm", "source_location": "L1"}
+
+    nodes = [
+        node("holder_act", "/obj/holder/act()"),
+        node("holder", "/obj/holder"),
+        node("thing_helper", "/obj/thing/helper()"),
+        node("thing", "/obj/thing"),
+    ]
+    raw_calls = [{
+        "caller_nid": "holder_act", "callee": "helper", "kind": "member",
+        "owner": "/obj/holder", "receiver": "part", "receiver_type": None,
+        "is_member_call": True, "source_file": "E:/proj/code.dm",
+        "source_location": "L5",
+    }]
+    dm_types = {"/obj/holder": {"parent": None,
+                                "vars": {"part": "/obj/thing"}}}
+    edges = []
+    resolve_dm_calls([{"dm_types": dm_types, "raw_calls": raw_calls}], nodes, edges)
+    assert (edges[0]["source"], edges[0]["target"]) == ("holder_act", "thing_helper")
+    assert edges[0]["confidence"] == "INFERRED"
+
+
+def test_dm_parent_path_follows_the_byond_type_tree():
+    from graphify.extractors.dm import _dm_parent_path
+
+    assert _dm_parent_path("/obj/item") == "/obj"
+    assert _dm_parent_path("/obj") == "/atom"
+    assert _dm_parent_path("/turf/simulated/floor") == "/turf/simulated"
+    assert _dm_parent_path("/turf") == "/atom"
+    assert _dm_parent_path("/mob/living") == "/mob"
+    assert _dm_parent_path("/mob") == "/atom/movable"
+    assert _dm_parent_path("/atom/movable") == "/atom"
+    assert _dm_parent_path("/atom") == "/datum"
+    assert _dm_parent_path("/spell/fireball") == "/spell"
+    # A user type at the top level still inherits /datum.
+    assert _dm_parent_path("/spell") == "/datum"
+    assert _dm_parent_path("/datum") == ""
+
+
+def test_dm_resolver_reaches_atom_procs_from_an_obj():
+    from graphify.extract import resolve_dm_calls
+
+    def node(nid, label):
+        return {"id": nid, "label": label, "file_type": "code",
+                "source_file": "E:/proj/code.dm", "source_location": "L1"}
+
+    nodes = [
+        node("obj_x", "/obj/x"),
+        node("obj_x_act", "/obj/x/act()"),
+        node("atom_vm", "/atom/visible_message()"),
+    ]
+    raw_calls = [{
+        "caller_nid": "obj_x_act", "callee": "visible_message", "kind": "member",
+        "owner": "/obj/x", "receiver": "src", "receiver_type": None,
+        "is_member_call": True, "source_file": "E:/proj/code.dm",
+        "source_location": "L4",
+    }]
+    edges = []
+    resolve_dm_calls([{"dm_types": {}, "raw_calls": raw_calls}], nodes, edges)
+    assert (edges[0]["source"], edges[0]["target"]) == ("obj_x_act", "atom_vm")
+
+
+
 # ── DMI (BYOND icon sheets) ──────────────────────────────────────────────────
 
 def test_dmi_no_error():
